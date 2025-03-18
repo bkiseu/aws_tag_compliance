@@ -2,11 +2,118 @@ provider "aws" {
   region = var.aws_region
 }
 
+# For getting the current account ID
+data "aws_caller_identity" "current" {}
+
+data "aws_organizations_organization" "existing_org" {}
+
 # Create Tag Compliance OU
 resource "aws_organizations_organizational_unit" "tag_compliance_ou" {
   name      = var.tag_compliance_ou_name
   parent_id = var.organization_root_id
 }
+
+###########################################
+# AWS Config Setup - Required for Config Rules
+###########################################
+
+# Create AWS Config role
+resource "aws_iam_role" "config_role" {
+  name = "aws-config-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "config.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+# Attach required policies to the AWS Config role
+resource "aws_iam_role_policy_attachment" "config_policy_attachment" {
+  role       = aws_iam_role.config_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
+}
+
+# Create S3 bucket for AWS Config recordings
+resource "aws_s3_bucket" "config_bucket" {
+  bucket_prefix = "aws-config-bucket-"
+  force_destroy = true
+}
+
+# S3 bucket policy for Config
+resource "aws_s3_bucket_policy" "config_bucket_policy" {
+  bucket = aws_s3_bucket.config_bucket.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowConfigBucketAccess"
+        Effect = "Allow"
+        Principal = {
+          Service = "config.amazonaws.com"
+        }
+        Action = [
+          "s3:GetBucketAcl",
+          "s3:ListBucket"
+        ]
+        Resource = aws_s3_bucket.config_bucket.arn
+      },
+      {
+        Sid    = "AllowConfigBucketDelivery"
+        Effect = "Allow"
+        Principal = {
+          Service = "config.amazonaws.com"
+        }
+        Action = "s3:PutObject"
+        Resource = "${aws_s3_bucket.config_bucket.arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl" = "bucket-owner-full-control"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# Create AWS Config configuration recorder
+resource "aws_config_configuration_recorder" "config_recorder" {
+  name     = "aws-config-recorder"
+  role_arn = aws_iam_role.config_role.arn
+
+  recording_group {
+    all_supported                 = true
+    include_global_resource_types = true
+  }
+}
+
+# Create AWS Config delivery channel
+resource "aws_config_delivery_channel" "config_delivery_channel" {
+  name           = "aws-config-delivery-channel"
+  s3_bucket_name = aws_s3_bucket.config_bucket.bucket
+
+  depends_on = [aws_config_configuration_recorder.config_recorder]
+}
+
+# Start the AWS Config recorder
+resource "aws_config_configuration_recorder_status" "config_recorder_status" {
+  name       = aws_config_configuration_recorder.config_recorder.name
+  is_enabled = true
+
+  depends_on = [aws_config_delivery_channel.config_delivery_channel]
+}
+
+###########################################
+# Tag Compliance SCP
+###########################################
 
 # Create Tag Compliance SCP
 resource "aws_organizations_policy" "tag_compliance_scp" {
@@ -25,7 +132,6 @@ resource "aws_organizations_policy" "tag_compliance_scp" {
           "s3:CreateBucket",
           "rds:CreateDBInstance",
           "dynamodb:CreateTable"
-          # Add more resource creation APIs as needed
         ]
         Resource  = "*"
         Condition = {
@@ -36,12 +142,19 @@ resource "aws_organizations_policy" "tag_compliance_scp" {
       }
     ]
   })
+
 }
 
 resource "aws_organizations_policy_attachment" "attach_to_tag_compliance_ou" {
   policy_id = aws_organizations_policy.tag_compliance_scp.id
   target_id = aws_organizations_organizational_unit.tag_compliance_ou.id
+
+  depends_on = [aws_organizations_policy.tag_compliance_scp]
 }
+
+###########################################
+# AWS Config Rule for Tag Monitoring
+###########################################
 
 # Set up AWS Config rule for tag monitoring
 resource "aws_config_config_rule" "required_tags_rule" {
@@ -66,7 +179,13 @@ resource "aws_config_config_rule" "required_tags_rule" {
       "AWS::DynamoDB::Table"
     ]
   }
+
+  depends_on = [aws_config_configuration_recorder_status.config_recorder_status]
 }
+
+###########################################
+# Notification System
+###########################################
 
 # Create SNS topic for notifications
 resource "aws_sns_topic" "tag_compliance_notifications" {
@@ -80,6 +199,10 @@ resource "aws_sns_topic_subscription" "email_subscriptions" {
   protocol  = "email"
   endpoint  = each.value
 }
+
+###########################################
+# Lambda Functions for Automation
+###########################################
 
 # IAM role for Lambda functions
 resource "aws_iam_role" "lambda_role" {
@@ -179,8 +302,10 @@ resource "aws_lambda_function" "tag_compliance_notification" {
     }
   }
 }
-# For getting the current account ID
-data "aws_caller_identity" "current" {}
+
+###########################################
+# EventBridge Rules
+###########################################
 
 # EventBridge rule for new account creation
 resource "aws_cloudwatch_event_rule" "new_account_created" {
@@ -188,9 +313,10 @@ resource "aws_cloudwatch_event_rule" "new_account_created" {
   description = "Capture when a new AWS account is created"
 
   event_pattern = jsonencode({
-    source      = ["aws.organizations"],
+    source      = ["aws.organizations", "custom.organizations"],
     detail-type = ["AWS API Call via CloudTrail"],
     detail = {
+      eventSource = ["organizations.amazonaws.com"],
       eventName = ["CreateAccount", "InviteAccountToOrganization"]
     }
   })

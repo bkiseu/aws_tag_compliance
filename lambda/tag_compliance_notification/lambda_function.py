@@ -20,7 +20,7 @@ def lambda_handler(event, context):
     try:
         # Parse Config rule finding from the event
         config_event = event['detail']
-        account_id = config_event['accountId']
+        account_id = config_event['awsAccountId']
         resource_type = config_event['resourceType']
         resource_id = config_event['resourceId']
         aws_region = config_event['awsRegion']

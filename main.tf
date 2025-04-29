@@ -275,11 +275,14 @@ resource "aws_lambda_function" "process_new_account" {
   
   filename         = data.archive_file.process_new_account_zip.output_path
   source_code_hash = data.archive_file.process_new_account_zip.output_base64sha256
-  
+
   environment {
     variables = {
       TAG_COMPLIANCE_OU_ID = aws_organizations_organizational_unit.tag_compliance_ou.id,
       SNS_TOPIC_ARN        = aws_sns_topic.tag_compliance_notifications.arn
+      ACCOUNT_ID       = data.aws_caller_identity.current.account_id,
+      SES_SENDER_EMAIL = var.ses_sender_email
+      SES_SENDER_NAME  = var.ses_sender_name
     }
   }
 }

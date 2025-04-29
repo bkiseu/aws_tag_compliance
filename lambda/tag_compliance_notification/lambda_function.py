@@ -1,8 +1,8 @@
-# tag-compliance-notification/lambda_function.py
 import json
 import os
 import boto3
 import logging
+import re
 
 # Set up logging
 logger = logging.getLogger()
@@ -10,6 +10,7 @@ logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
 sns = boto3.client('sns')
+ses = boto3.client('ses')
 
 def lambda_handler(event, context):
     """
@@ -20,7 +21,7 @@ def lambda_handler(event, context):
     try:
         # Parse Config rule finding from the event
         config_event = event['detail']
-        account_id = config_event['awsAccountId']
+        account_id = config_event['accountId']
         resource_type = config_event['resourceType']
         resource_id = config_event['resourceId']
         aws_region = config_event['awsRegion']
@@ -28,12 +29,11 @@ def lambda_handler(event, context):
         
         if compliance_type == 'NON_COMPLIANT':
             # Get resource details to determine which tags are missing
-            missing_tags = determine_missing_tags(
-                aws_region, 
-                resource_type, 
-                resource_id,
-                ['Environment', 'Layer', 'Component', 'Product']
-            )
+            resource_info = get_resource_info(aws_region, resource_type, resource_id)
+            missing_tags = determine_missing_tags(resource_info, ['Environment', 'Layer', 'Component', 'Product'])
+            
+            # Check if resource has owner email
+            owner_email = extract_owner_email(resource_info)
             
             # Format missing tags for the message
             missing_tags_formatted = '\n'.join([f"- {tag}" for tag in missing_tags])
@@ -41,7 +41,7 @@ def lambda_handler(event, context):
             # Format tag addition CLI command
             cli_tags = ' \\\n            '.join([f"--tags Key={tag},Value=YOUR_VALUE" for tag in missing_tags])
             
-            # Send notification about non-compliant resource
+            # Format the notification message
             message = f"""
             A non-compliant resource has been detected in AWS account {account_id}:
             
@@ -70,6 +70,33 @@ def lambda_handler(event, context):
             For assistance, please contact the Cloud Operations team.
             """
             
+            # If owner email is found, send direct notification via SES
+            if owner_email:
+                try:
+                    logger.info(f"Sending direct notification to resource owner: {owner_email}")
+                    
+                    response = ses.send_email(
+                        Source=os.environ.get('SES_SENDER_EMAIL'),
+                        Destination={
+                            'ToAddresses': [owner_email]
+                        },
+                        Message={
+                            'Subject': {
+                                'Data': f"Tag Compliance Alert: Your Resource in Account {account_id} is Non-Compliant"
+                            },
+                            'Body': {
+                                'Text': {
+                                    'Data': message
+                                }
+                            }
+                        }
+                    )
+                    logger.info(f"SES notification sent: {response['MessageId']}")
+                except Exception as e:
+                    logger.error(f"Error sending SES notification: {str(e)}")
+                    # Still send to SNS as fallback
+            
+            # Always send to the standard SNS topic for audit and broader notification
             sns.publish(
                 TopicArn=os.environ.get('SNS_TOPIC_ARN'),
                 Subject=f"Tag Compliance Alert: Non-Compliant Resource Detected in Account {account_id}",
@@ -122,31 +149,50 @@ def lambda_handler(event, context):
         
         raise
 
-def determine_missing_tags(region, resource_type, resource_id, required_tags):
+def get_resource_info(region, resource_type, resource_id):
     """
-    Helper function to determine which required tags are missing from a resource
+    Gets detailed information about a resource, including its tags
     """
-    # Implementation would vary based on resource type
-    # This is a simplified example
-    
     tagging = boto3.client('resourcegroupstaggingapi', region_name=region)
     
     try:
+        arn = convert_to_arn(resource_type, resource_id, region)
         response = tagging.get_resources(
-            ResourceARNList=[convert_to_arn(resource_type, resource_id, region)]
+            ResourceARNList=[arn]
         )
         
-        resources = response.get('ResourceTagMappingList', [])
-        
-        if not resources:
-            return required_tags  # All tags are missing
-        
-        existing_tag_keys = [tag['Key'] for tag in resources[0].get('Tags', [])]
-        return [tag_key for tag_key in required_tags if tag_key not in existing_tag_keys]
-    
+        if response.get('ResourceTagMappingList'):
+            return response['ResourceTagMappingList'][0]
+        return {'Tags': []}
     except Exception as e:
-        logger.error(f"Error getting resource tags: {str(e)}")
-        return required_tags  # Assume all tags are missing on error
+        logger.error(f"Error getting resource info: {str(e)}")
+        return {'Tags': []}
+
+def extract_owner_email(resource_info):
+    """
+    Extracts owner email from resource tags. Checks multiple possible tag keys.
+    """
+    possible_owner_tags = [
+        'Owner', 'owner', 'OwnerEmail', 'owner_email', 'Email', 'email',
+        'createdby', 'CreatedBy', 'created_by', 'ca:created-by'
+    ]
+    
+    for tag in resource_info.get('Tags', []):
+        if tag['Key'] in possible_owner_tags:
+            # Extract email using regex
+            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+            matches = re.findall(email_pattern, tag['Value'])
+            if matches:
+                return matches[0]
+    
+    return None
+
+def determine_missing_tags(resource_info, required_tags):
+    """
+    Determine which required tags are missing from the resource
+    """
+    existing_tag_keys = [tag['Key'] for tag in resource_info.get('Tags', [])]
+    return [tag_key for tag_key in required_tags if tag_key not in existing_tag_keys]
 
 def convert_to_arn(resource_type, resource_id, region):
     """

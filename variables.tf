@@ -26,3 +26,13 @@ variable "notification_emails" {
   type        = list(string)
   default     = []
 }
+
+variable "ses_sender_email" {
+  description = "Email address to use as the sender for SES emails to resource owners"
+  type        = string
+}
+variable "ses_sender_name" {
+  description = "Name to use as the sender for SES emails to resource owners"
+  type        = string
+  default     = "AWS Tag Compliance"
+}
